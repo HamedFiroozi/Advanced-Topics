@@ -1,1 +1,173 @@
+“””
+Codercise I.2.1
+“””
 
+def my_circuit(theta, phi):
+    qp.RX(theta, wires=2)
+    qp.CNOT(wires=[0, 1])
+    qp.Hadamard(wires=0)
+    qp.CNOT(wires=[2, 0])
+    qp.RY(phi, wires=1)
+    return qp.probs(wires=[0, 1, 2])
+
+“””
+Codercise I.2.2
+“””
+
+dev = qp.device("default.qubit", wires=3)
+def my_circuit(theta, phi, omega):
+    qp.RX(theta, wires=0)
+    qp.RY(phi, wires=1)
+    qp.RZ(omega, wires=2)
+    qp.CNOT(wires=[0, 1])
+    qp.CNOT(wires=[1, 2])
+    qp.CNOT(wires=[2, 0])
+    return qp.probs(wires=[0, 1, 2])
+my_qnode = qp.QNode(my_circuit, dev)
+theta, phi, omega = 0.1, 0.2, 0.3
+my_qnode(theta, phi, omega)
+
+“””
+Codercise I.2.3
+“””
+
+dev = qp.device("default.qubit", wires=3)
+@qp.qnode(dev)
+def my_circuit(theta, phi, omega):
+    qp.RX(theta, wires=0)
+    qp.RY(phi, wires=1)
+    qp.RZ(omega, wires=2)
+    qp.CNOT(wires=[0, 1])
+    qp.CNOT(wires=[1, 2])
+    qp.CNOT(wires=[2, 0])
+    return qp.probs(wires=[0, 1, 2])
+theta, phi, omega = 0.1, 0.2, 0.3
+my_circuit(theta, phi, omega)
+
+“””
+Codercise I.2.4
+“””
+
+dev = qp.device("default.qubit", wires=3)
+@qp.qnode(dev)
+def my_circuit(theta, phi, omega):
+    qp.RX(theta, wires=0)
+    qp.RY(phi, wires=1)
+    qp.RZ(omega, wires=2)
+    qp.CNOT(wires=[0, 1])
+    qp.CNOT(wires=[1, 2])
+    qp.CNOT(wires=[2, 0])
+    return qp.probs(wires=[0, 1, 2])
+depth = 4
+
+“””
+Codercise I.3.1
+“””
+
+dev = qp.device("default.qubit", wires=1)
+U = np.array([[1, 1], [1, -1]]) / np.sqrt(2)
+@qp.qnode(dev)
+def apply_u():
+    qp.QubitUnitary(U, wires=0)
+    return qp.state()
+
+“””
+Codercise I.3.2
+“””
+
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_u_as_rot(phi, theta, omega):
+    qp.Rot(phi, theta, omega, wires=0)
+    return qp.state()
+
+“””
+Codercise I.4.1
+“””
+
+dev = qp.device("default.qubit", wires=1)
+U = np.array([[1, 1], [1, -1]]) / np.sqrt(2)
+@qp.qnode(dev)
+def varied_initial_state(state):
+   
+    if state == 1:
+        qp.PauliX(wires=0)
+    qp.QubitUnitary(U, wires=0)
+    return qp.state()
+
+“””
+Codercise I.4.2
+“””
+
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_hadamard():
+    qp.Hadamard(wires=0)
+    return qp.state()
+
+“””
+Codercise I.4.3
+“””
+
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_hadamard_to_state(state):
+    if state == 1:
+        qp.PauliX(wires=0)
+    qp.Hadamard(wires=0)
+    return qp.state()
+print(apply_hadamard_to_state(0))
+print(apply_hadamard_to_state(1)) 
+
+“””
+Codercise I.4.4
+“””
+
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_hxh(state):
+    if state == 1:
+        qp.PauliX(wires=0)
+    qp.Hadamard(wires=0)
+    qp.PauliX(wires=0)
+    qp.Hadamard(wires=0)
+    return qp.state()
+print(apply_hxh(0))
+print(apply_hxh(1))
+
+“””
+Codercise I.5.1
+“””
+
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_z_to_plus():
+    qp.Hadamard(wires=0)
+    qp.PauliZ(wires=0)
+    return qp.state()
+print(apply_z_to_plus())
+
+“””
+Codercise I.5.2
+“””
+
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def fake_z():
+    qp.Hadamard(wires=0)
+    qp.RZ(np.pi, wires=0)
+    return qp.state()
+
+“””
+Codercise I.5.3
+“””
+
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def many_rotations():
+    qp.Hadamard(wires=0)
+    qp.S(wires=0)
+    qp.adjoint(qp.T)(wires=0)
+    qp.RZ(0.3, wires=0)
+    qp.adjoint(qp.S)(wires=0)
+    return qp.state()

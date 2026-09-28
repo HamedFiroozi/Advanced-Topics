@@ -1,0 +1,313 @@
+“””
+Codercise I.6.1
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_rx_pi(state):
+    if state == 1:
+        qp.PauliX(wires=0)
+    qp.RX(np.pi, wires=0)
+    return qp.state()
+print(apply_rx_pi(0))
+print(apply_rx_pi(1))
+
+“””
+Codercise I.6.2
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_rx(theta, state):
+    if state == 1:
+        qp.PauliX(wires=0)
+    qp.RX(theta, wires=0)
+    return qp.state()
+angles = np.linspace(0, 4 * np.pi, 200)
+output_states = np.array([apply_rx(t, 0) for t in angles])
+
+plot = plotter(angles, output_states)
+
+“””
+Codercise I.6.3
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_ry(theta, state):
+    if state == 1:
+        qp.PauliX(wires=0)
+    qp.RY(theta, wires=0)
+    return qp.state()
+angles = np.linspace(0, 4 * np.pi, 200)
+output_states = np.array([apply_ry(t, 0) for t in angles])
+plot = plotter(angles, output_states)
+
+“””
+Codercise I.7.1
+“””
+dev = qp.device("default.qubit", wires=1)
+phi, theta, omega = np.pi/2, np.pi/2, np.pi/2
+@qp.qnode(dev)
+def hadamard_with_rz_rx():
+    qp.RZ(phi, wires=0)
+    qp.RX(theta, wires=0)
+    qp.RZ(omega, wires=0)
+    return qp.state()
+
+“””
+Codercise I.7.2
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def convert_to_rz_rx():
+    qp.RZ(np.pi / 2, wires=0)
+    qp.RX(np.pi / 2, wires=0)
+    qp.RZ(7 * np.pi / 4, wires=0)
+    qp.RX(np.pi, wires=0)
+    return qp.state()
+
+“””
+Codercise I.7.3
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def unitary_with_h_and_t():
+    qp.Hadamard(wires=0)
+    qp.T(wires=0)
+    qp.Hadamard(wires=0)
+    qp.T(wires=0)
+    qp.T(wires=0)
+    qp.Hadamard(wires=0)
+    return qp.state()
+
+“””
+Codercise I.8.1
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def prepare_state():
+    qp.Hadamard(wires=0)
+    qp.RZ(5 * np.pi / 4, wires=0)
+    return qp.state()
+
+“””
+Codercise I.8.2
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def prepare_state():
+    qp.RX(np.pi / 3, wires=0)
+    return qp.state()
+
+“””
+Codercise I.8.3
+“””
+v = np.array([0.52889389 - 0.14956775j, 0.67262317 + 0.49545818j])
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def prepare_state(state=v):
+    qp.MottonenStatePreparation(
+        state_vector=state,
+        wires=[0]
+    )
+    return qp.state()
+print(prepare_state(v))
+print()
+print(qp.draw(prepare_state, level="device")(v))
+
+“””
+Codercise I.9.1
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def apply_h_and_measure(state):
+    if state == 1:
+        qp.PauliX(wires=0)
+    qp.Hadamard(wires=0)
+    return qp.probs(wires=0)
+print(apply_h_and_measure(0))
+print(apply_h_and_measure(1))
+
+“””
+Codercise I.9.2
+“””
+def prepare_psi():
+    qp.RX(-2 * np.pi / 3, wires=0)
+def y_basis_rotation():
+    qp.Hadamard(wires=0)
+    qp.S(wires=0)
+
+“””
+Codercise I.9.3
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def measure_in_y_basis():
+    prepare_psi()
+    qp.adjoint(y_basis_rotation)()
+    return qp.probs(wires=0)
+print(measure_in_y_basis())
+
+“””
+Codercise I.10.1
+“””
+dev = qp.device("default.qubit", wires=1)
+@qp.qnode(dev)
+def circuit():
+    qp.RX(np.pi / 4, wires=0)
+    qp.Hadamard(wires=0)
+    qp.PauliZ(wires=0)
+    return qp.expval(qp.PauliY(wires=0))
+print(circuit())
+
+“””
+Codercise I.10.2
+“””
+shot_results = []
+shot_values = [100, 1000, 10000, 100000, 1000000]
+
+for shots in shot_values:
+    dev = qp.device("default.qubit", wires=1, shots=shots)
+    @qp.qnode(dev)
+    def circuit():
+        qp.RX(np.pi / 4, wires=0)
+        qp.Hadamard(wires=0)
+        qp.PauliZ(wires=0)
+        return qp.expval(qp.PauliY(wires=0))
+    shot_results.append(circuit())
+print(qp.math.unwrap(shot_results))
+
+“””
+Codercise I.10.3
+“””
+dev = qp.device("default.qubit", wires=1, shots=100000)
+@qp.qnode(dev)
+def circuit():
+    qp.RX(np.pi / 4, wires=0)
+    qp.Hadamard(wires=0)
+    qp.PauliZ(wires=0)
+    return qp.sample(qp.PauliY(wires=0))
+def compute_expval_from_samples(samples):
+    estimated_expval = np.mean(samples)
+    return estimated_expval
+samples = circuit()
+print(compute_expval_from_samples(samples))
+
+“””
+Codercise I.10.4
+“””
+def variance_experiment(n_shots):
+    n_trials = 100
+    dev = qp.device(
+        "default.qubit",
+        wires=1,
+        shots=n_shots
+    )
+    @qp.qnode(dev)
+    def circuit():
+        qp.Hadamard(wires=0)
+        return qp.expval(qp.PauliZ(wires=0))
+    results = [circuit() for _ in range(n_trials)]
+    return np.var(results)
+def variance_scaling(n_shots):
+    estimated_variance = 1 / n_shots
+    return estimated_variance
+shot_vals = [10, 20, 40, 100, 200, 400, 1000, 2000, 4000]
+results_experiment = [
+    variance_experiment(shots)
+    for shots in shot_vals
+]
+results_scaling = [
+    variance_scaling(shots)
+    for shots in shot_vals
+]
+plot = plotter(
+    shot_vals,
+    results_experiment,
+    results_scaling
+)
+
+“””
+Codercise I.11.1
+“””
+num_wires = 3
+dev = qp.device("default.qubit", wires=num_wires)
+@qp.qnode(dev)
+def make_basis_state(basis_id):
+    binary = np.binary_repr(basis_id, width=num_wires)
+    for wire, bit in enumerate(binary):
+        if bit == "1":
+            qp.PauliX(wires=wire)
+    return qp.state()
+basis_id = 3
+print(f"Output state = {make_basis_state(basis_id)}")
+
+“””
+Codercise I.11.2
+“””
+dev = qp.device("default.qubit", wires=2)
+@qp.qnode(dev)
+def two_qubit_circuit():
+    qp.Hadamard(wires=0)
+    qp.PauliX(wires=1)
+    return (
+        qp.expval(qp.PauliY(wires=0)),
+        qp.expval(qp.PauliZ(wires=1))
+    )
+
+“””
+Codercise I.11.3
+“””
+dev = qp.device("default.qubit", wires=2)
+@qp.qnode(dev)
+def create_one_minus():
+    qp.PauliX(wires=0)
+    qp.PauliX(wires=1)
+    qp.Hadamard(wires=1)
+    return qp.expval(
+        qp.PauliZ(0) @ qp.PauliX(1)
+    )
+print(create_one_minus())
+
+“””
+Codercise I.11.4
+“””
+dev = qp.device("default.qubit", wires=2)
+@qp.qnode(dev)
+def circuit_1(theta):
+    qp.RX(theta, wires=0)
+    qp.RY(2 * theta, wires=1)
+    return (
+        qp.expval(qp.PauliZ(0)),
+        qp.expval(qp.PauliZ(1))
+    )
+@qp.qnode(dev)
+def circuit_2(theta):
+    qp.RX(theta, wires=0)
+    qp.RY(2 * theta, wires=1)
+    return qp.expval(
+        qp.PauliZ(0) @ qp.PauliZ(1)
+    )
+def zi_iz_combination(ZI_results, IZ_results):
+    combined_results = np.zeros(len(ZI_results))
+    combined_results = ZI_results * IZ_results
+    return combined_results
+theta = np.linspace(0, 2 * np.pi, 100)
+circuit_1_results = np.array(
+    [circuit_1(t) for t in theta]
+)
+ZI_results = circuit_1_results[:, 0]
+IZ_results = circuit_1_results[:, 1]
+
+combined_results = zi_iz_combination(
+    ZI_results,
+    IZ_results
+)
+ZZ_results = np.array(
+    [circuit_2(t) for t in theta]
+)
+plot = plotter(
+    theta,
+    ZI_results,
+    IZ_results,
+    ZZ_results,
+    combined_results
+)

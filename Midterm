@@ -1,1 +1,403 @@
+from pathlib import Path
 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import least_squares
+
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Statevector, SparsePauliOp
+
+
+# ============================================================
+# 0. OUTPUT DIRECTORY
+# ============================================================
+
+try:
+    OUTPUT_DIR = Path(__file__).resolve().parent
+except NameError:
+    OUTPUT_DIR = Path.cwd()
+
+print(f"Output directory: {OUTPUT_DIR}")
+
+
+# ============================================================
+# 1. CLASSICAL BENCHMARK
+# ============================================================
+
+X_MIN = 0.0
+X_MAX = 2.0
+N_COLLOCATION = 41
+N_PLOT = 201
+N_PARAMETERS = 6
+
+x_collocation = np.linspace(X_MIN, X_MAX, N_COLLOCATION)
+x_plot = np.linspace(X_MIN, X_MAX, N_PLOT)
+
+
+def y_exact(x):
+    """Exact solution of y'(x)+y(x)=0 with y(0)=1."""
+    return np.exp(-np.asarray(x, dtype=float))
+
+
+# ============================================================
+# 2. ONE-QUBIT VARIATIONAL ANSATZ
+# ============================================================
+
+# phi_theta(x) = theta_0 + theta_1*x + ... + theta_5*x^5
+
+
+def phi_theta(x, theta):
+    """Polynomial angle used in the Ry gate."""
+    x = np.asarray(x, dtype=float)
+    theta = np.asarray(theta, dtype=float)
+
+    powers = np.stack([x**k for k in range(len(theta))], axis=0)
+    return np.tensordot(theta, powers, axes=(0, 0))
+
+
+def dphi_dx(x, theta):
+    """Analytic derivative d(phi_theta)/dx."""
+    x = np.asarray(x, dtype=float)
+    theta = np.asarray(theta, dtype=float)
+
+    derivative = np.zeros_like(x, dtype=float)
+    for k in range(1, len(theta)):
+        derivative += k * theta[k] * x ** (k - 1)
+
+    return derivative
+
+
+def q_expectation_analytic(x, theta):
+    """Ideal <Z> expectation for Ry(phi)|0>: <Z> = cos(phi)."""
+    return np.cos(phi_theta(x, theta))
+
+
+# ============================================================
+# 3. TRIAL SOLUTION THAT ENFORCES y(0)=1
+# ============================================================
+
+# y_theta(x) = 1 + x/2 * [q_theta(x)-1]
+# Therefore y_theta(0)=1 for every theta.
+
+
+def y_theta_analytic(x, theta):
+    x = np.asarray(x, dtype=float)
+    q = q_expectation_analytic(x, theta)
+    return 1.0 + 0.5 * x * (q - 1.0)
+
+
+def dy_theta_dx_analytic(x, theta):
+    """Analytic derivative of the trial solution."""
+    x = np.asarray(x, dtype=float)
+
+    phi = phi_theta(x, theta)
+    q = np.cos(phi)
+    dqdx = -np.sin(phi) * dphi_dx(x, theta)
+
+    return 0.5 * (q - 1.0) + 0.5 * x * dqdx
+
+
+# ============================================================
+# 4. ODE RESIDUAL AND LEAST-SQUARES OBJECTIVE
+# ============================================================
+
+
+def residual_analytic(x, theta):
+    """R(x;theta) = y_theta'(x) + y_theta(x)."""
+    return dy_theta_dx_analytic(x, theta) + y_theta_analytic(x, theta)
+
+
+loss_history = []
+
+
+def residual_vector(theta):
+    """Residual vector evaluated at all collocation points."""
+    r = residual_analytic(x_collocation, theta)
+
+    # Record mean squared residual for a convergence diagnostic.
+    loss_history.append(float(np.mean(r**2)))
+
+    return r
+
+
+# ============================================================
+# 5. CLASSICAL OPTIMIZATION
+# ============================================================
+
+# A nonlinear least-squares solver is natural here because the objective is
+# explicitly a sum of squared residuals.
+
+theta_initial = np.array(
+    [3.0, 1.5, -1.0, 0.5, -0.1, 0.01],
+    dtype=float,
+)
+
+initial_loss = float(
+    np.mean(residual_analytic(x_collocation, theta_initial) ** 2)
+)
+
+print("\nInitial parameters:")
+print(theta_initial)
+print("Initial loss:", initial_loss)
+
+result = least_squares(
+    residual_vector,
+    theta_initial,
+    xtol=1.0e-12,
+    ftol=1.0e-12,
+    gtol=1.0e-12,
+    max_nfev=5000,
+)
+
+theta_opt = np.asarray(result.x, dtype=float)
+final_loss = float(np.mean(result.fun**2))
+
+print("\nOptimization successful:", result.success)
+print("Optimizer message:", result.message)
+print("\nOptimal parameters:")
+print(theta_opt)
+print("\nFinal loss:")
+print(final_loss)
+
+
+# ============================================================
+# 6. IDEAL VARIATIONAL RESULT
+# ============================================================
+
+y_reference = y_exact(x_plot)
+y_ideal = y_theta_analytic(x_plot, theta_opt)
+residual_values = residual_analytic(x_plot, theta_opt)
+
+mse_ideal = float(np.mean((y_ideal - y_reference) ** 2))
+rms_residual = float(np.sqrt(np.mean(residual_values**2)))
+boundary_value = float(y_theta_analytic(np.array([0.0]), theta_opt)[0])
+
+print("\n--- Preliminary Results ---")
+print("Ideal variational MSE:", mse_ideal)
+print("RMS ODE residual:", rms_residual)
+print("Boundary value y_theta(0):", boundary_value)
+
+
+# ============================================================
+# 7. QISKIT STATEVECTOR VERIFICATION
+# ============================================================
+
+Z = SparsePauliOp.from_list([("Z", 1.0)])
+
+
+def build_quantum_circuit(x, theta):
+    """Build Ry(phi_theta(x)) acting on |0>."""
+    phi = float(phi_theta(np.array([x]), theta)[0])
+
+    qc = QuantumCircuit(1)
+    qc.ry(phi, 0)
+    return qc
+
+
+def q_expectation_statevector(x, theta):
+    """Evaluate <Z> directly from a Qiskit Statevector."""
+    qc = build_quantum_circuit(x, theta)
+    state = Statevector.from_instruction(qc)
+    return float(np.real(state.expectation_value(Z)))
+
+
+q_qiskit = np.array(
+    [q_expectation_statevector(x, theta_opt) for x in x_plot],
+    dtype=float,
+)
+
+q_formula = q_expectation_analytic(x_plot, theta_opt)
+
+max_qiskit_difference = float(
+    np.max(np.abs(q_qiskit - q_formula))
+)
+
+print(
+    "Maximum |Qiskit statevector - analytic <Z>|:",
+    max_qiskit_difference,
+)
+
+# Reconstruct y(x) from the Qiskit statevector expectation values.
+y_qiskit = 1.0 + 0.5 * x_plot * (q_qiskit - 1.0)
+mse_qiskit = float(np.mean((y_qiskit - y_reference) ** 2))
+
+print("Qiskit-statevector MSE:", mse_qiskit)
+
+
+# ============================================================
+# 8. FINITE-SHOT STATISTICAL MODEL
+# ============================================================
+
+# For a Z measurement,
+#   P(0) = (1+<Z>)/2,
+#   P(1) = (1-<Z>)/2.
+# We draw a finite number of measurements to isolate shot noise.
+# This is NOT a device-noise simulation.
+
+N_SHOTS = 4096
+RNG_SEED = 614801
+rng = np.random.default_rng(RNG_SEED)
+
+q_exact_grid = q_expectation_analytic(x_plot, theta_opt)
+p0 = np.clip((1.0 + q_exact_grid) / 2.0, 0.0, 1.0)
+
+n0 = rng.binomial(N_SHOTS, p0)
+n1 = N_SHOTS - n0
+
+q_shots = (n0 - n1) / float(N_SHOTS)
+y_shots = 1.0 + 0.5 * x_plot * (q_shots - 1.0)
+
+mse_shots = float(np.mean((y_shots - y_reference) ** 2))
+
+print(f"Finite-shot model ({N_SHOTS} shots) MSE:", mse_shots)
+
+
+# ============================================================
+# 9. FIGURES
+# ============================================================
+
+# Figure 1: exact vs ideal variational solution
+plt.figure(figsize=(7, 5))
+plt.plot(x_plot, y_reference, linewidth=2, label="Exact solution: exp(-x)")
+plt.plot(x_plot, y_ideal, "--", linewidth=2, label="Variational model")
+plt.xlabel("x")
+plt.ylabel("y(x)")
+plt.title("Exact Solution vs Variational Quantum Approximation")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+path_exact = OUTPUT_DIR / "exact_vs_vqa.png"
+plt.savefig(path_exact, dpi=300, bbox_inches="tight")
+plt.show()
+print(f"Saved: {path_exact}")
+
+# Figure 2: residual
+plt.figure(figsize=(7, 5))
+plt.plot(x_plot, residual_values, linewidth=2)
+plt.axhline(0.0, linestyle="--", linewidth=1)
+plt.xlabel("x")
+plt.ylabel("R(x)")
+plt.title("Differential-Equation Residual")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+path_residual = OUTPUT_DIR / "residual.png"
+plt.savefig(path_residual, dpi=300, bbox_inches="tight")
+plt.show()
+print(f"Saved: {path_residual}")
+
+# Figure 3: recorded residual evaluations
+plt.figure(figsize=(7, 5))
+plt.semilogy(
+    np.arange(1, len(loss_history) + 1),
+    loss_history,
+    linewidth=2,
+)
+plt.xlabel("Residual-function evaluation")
+plt.ylabel("Mean squared residual")
+plt.title("Least-Squares Optimization Convergence")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+path_loss = OUTPUT_DIR / "optimization_loss.png"
+plt.savefig(path_loss, dpi=300, bbox_inches="tight")
+plt.show()
+print(f"Saved: {path_loss}")
+
+# Figure 4: ideal and finite-shot result
+plt.figure(figsize=(7, 5))
+plt.plot(x_plot, y_reference, linewidth=2, label="Exact solution")
+plt.plot(x_plot, y_ideal, "--", linewidth=2, label="Ideal variational result")
+plt.scatter(
+    x_plot[::5],
+    y_shots[::5],
+    s=22,
+    label=f"Finite-shot model ({N_SHOTS} shots)",
+)
+plt.xlabel("x")
+plt.ylabel("y(x)")
+plt.title("Ideal and Finite-Shot Results")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+path_shots = OUTPUT_DIR / "finite_shot_result.png"
+plt.savefig(path_shots, dpi=300, bbox_inches="tight")
+plt.show()
+print(f"Saved: {path_shots}")
+
+
+# ============================================================
+# 10. REPRESENTATIVE CIRCUIT
+# ============================================================
+
+example_x = 1.0
+example_circuit = build_quantum_circuit(example_x, theta_opt)
+
+print("\nRepresentative circuit at x=1:")
+print(example_circuit.draw(output="text"))
+
+
+# ============================================================
+# 11. IBM QUANTUM HARDWARE - FINAL PROJECT STEP
+# ============================================================
+
+# No IBM QPU result is claimed in the midterm.
+# For the final project, the next hardware steps are:
+#   1. authenticate with IBM Quantum Runtime,
+#   2. choose an operational backend,
+#   3. transpile the circuit,
+#   4. measure <Z> on hardware,
+#   5. reconstruct y_theta(x),
+#   6. compare exact, ideal, finite-shot, and hardware results,
+#   7. record backend name, job ID, and error metric.
+
+
+# ============================================================
+# 12. TRUNCATED MOMENTUM HIERARCHY - FINAL PROJECT SCAFFOLD
+# ============================================================
+
+# Generic linearized form:
+#     dM/dt = A(t) M(t) + b(t)
+#
+# Residual:
+#     R(t;theta) = dM_theta/dt - A(t)M_theta(t) - b(t)
+#
+# The physical hierarchy, truncation order, closure relation, A(t), b(t),
+# and initial conditions must come from the specific final-project model.
+
+
+def hierarchy_residual(M, dMdt, A, b):
+    """Generic vector residual R=dM/dt-A M-b."""
+    M = np.asarray(M, dtype=float)
+    dMdt = np.asarray(dMdt, dtype=float)
+    A = np.asarray(A, dtype=float)
+    b = np.asarray(b, dtype=float)
+
+    return dMdt - A @ M - b
+
+
+def hierarchy_cost(residuals):
+    """Mean squared L2 norm of hierarchy residual vectors."""
+    residuals = np.asarray(residuals, dtype=float)
+    return float(np.mean(np.sum(residuals**2, axis=1)))
+
+
+# ============================================================
+# 13. MIDTERM SUMMARY
+# ============================================================
+
+print("\n================ MIDTERM PROJECT SUMMARY ================")
+print("Benchmark ODE: y'(x) + y(x) = 0")
+print("Initial condition: y(0) = 1")
+print("Exact solution: exp(-x)")
+print("Quantum ansatz: |psi(x,theta)> = Ry(phi_theta(x))|0>")
+print("Observable: Pauli Z")
+print("Number of trainable parameters:", N_PARAMETERS)
+print("Collocation points:", N_COLLOCATION)
+print("Initial loss:", initial_loss)
+print("Final loss:", final_loss)
+print("Ideal variational MSE:", mse_ideal)
+print("Qiskit-statevector MSE:", mse_qiskit)
+print("Finite-shot MSE:", mse_shots)
+print("RMS ODE residual:", rms_residual)
+print("IBM Quantum hardware execution: planned for final project")
+print("Truncated momentum hierarchy: planned extension for final project")
+print("=========================================================")

@@ -1,0 +1,2297 @@
+from pathlib import Path
+import argparse
+import csv
+import datetime
+import hashlib
+import importlib.metadata
+import json
+import platform
+import time
+import numpy as np
+import scipy
+from scipy.optimize import least_squares
+from scipy.linalg import expm
+from scipy.special import spherical_jn
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+BASE = Path(__file__).resolve().parent / "Final_Project_output"
+plt.rcParams.update(
+    {
+        "font.size": 10,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.dpi": 150,
+    }
+)
+
+
+# ========================================================================
+# 1. CLASSICAL REFERENCES, CIRCUIT READOUTS AND LOCAL TRAINING
+# ========================================================================
+
+
+def matrix(N, k=1.0, nu=0.2):
+    A = -nu * np.eye(N + 1)
+    for l in range(N + 1):
+        if l:
+            A[l, l - 1] = k * l / (2 * l + 1)
+        if l < N:
+            A[l, l + 1] = -k * (l + 1) / (2 * l + 1)
+    return A
+
+
+def classical(N, t):
+    e = np.eye(N + 1)[:, 0]
+    return np.array([expm(matrix(N) * x) @ e for x in t])
+
+
+def infinite(N, t):
+    return np.exp(-0.2 * np.asarray(t)[:, None]) * np.stack(
+        [spherical_jn(l, t) for l in range(N + 1)], axis=1
+    )
+
+
+def features(t, d):
+    z = np.asarray(t) - 1
+    V = np.stack([z**j for j in range(d + 1)], axis=1)
+    D = np.stack(
+        [np.zeros_like(z)] + [j * z ** (j - 1) for j in range(1, d + 1)], axis=1
+    )
+    return V, D
+
+
+def evaluate(theta, t, m, kind="single", degree=5, return_q=False):
+    V, D = features(t, degree)
+    if kind == "single":
+        th = np.asarray(theta).reshape(m, degree + 1)
+        a = V @ th.T
+        ad = D @ th.T
+        q = np.cos(a)
+        qd = -np.sin(a) * ad
+    else:
+        th = np.asarray(theta).reshape(m // 2, 3, degree + 1)
+        a, b, c = np.einsum("td,pgd->gtp", V, th)
+        ad, bd, cd = np.einsum("td,pgd->gtp", D, th)
+        ca, sa, cb, sb, cc, sc = (
+            np.cos(a),
+            np.sin(a),
+            np.cos(b),
+            np.sin(b),
+            np.cos(c),
+            np.sin(c),
+        )
+        if kind == "entangled":
+            q0 = ca * cc - sa * sb * sc
+            q1 = ca * cb
+            q0d = (
+                -sa * ad * cc
+                - ca * sc * cd
+                - ca * ad * sb * sc
+                - sa * cb * bd * sc
+                - sa * sb * cc * cd
+            )
+            q1d = -sa * ad * cb - ca * sb * bd
+        else:
+            q0 = np.cos(a + c)
+            q1 = cb
+            q0d = -np.sin(a + c) * (ad + cd)
+            q1d = -sb * bd
+        q = np.stack([q0, q1], axis=2).reshape(len(t), m)
+        qd = np.stack([q0d, q1d], axis=2).reshape(len(t), m)
+    if return_q:
+        return q, qd
+    y = np.asarray(t)[:, None] * q
+    y[:, 0] += 1
+    return y, q + np.asarray(t)[:, None] * qd
+
+
+def fit(N, kind, degree=5, seeds=(11, 22, 33)):
+    m = N + 1
+    t = np.linspace(0, 2, 41)
+    A = matrix(N)
+    n = m * (degree + 1) if kind == "single" else (m // 2) * 3 * (degree + 1)
+    runs = []
+    best = None
+    for seed in seeds:
+        rng = np.random.default_rng(seed)
+        p = rng.normal(0, 0.08, n)
+        if kind == "single":
+            p.reshape(m, -1)[:, 0] = [1.9] + [1.2] * (m - 1)
+        else:
+            p.reshape(m // 2, 3, -1)[:, :, 0] = np.array([1.2, 0.8, 1.0])
+
+        def residual(th):
+            y, dy = evaluate(th, t, m, kind, degree)
+            return (dy - y @ A.T).ravel()
+
+        start = time.perf_counter()
+        r = least_squares(
+            residual,
+            p,
+            method="trf",
+            jac="3-point",
+            ftol=1e-11,
+            xtol=1e-11,
+            gtol=1e-11,
+            max_nfev=700,
+        )
+        run = {
+            "seed": seed,
+            "loss": float(np.mean(r.fun**2)),
+            "nfev": r.nfev,
+            "optimality": float(r.optimality),
+            "status": int(r.status),
+            "seconds": time.perf_counter() - start,
+        }
+        runs.append(run)
+        if best is None or run["loss"] < best[0]:
+            best = (run["loss"], r.x)
+    grid = np.linspace(0, 2, 201)
+    y, dy = evaluate(best[1], grid, m, kind, degree)
+    ref = classical(N, grid)
+    exact = infinite(N, grid)
+    return {
+        "N": N,
+        "kind": kind,
+        "degree": degree,
+        "parameters": n,
+        "theta": best[1].tolist(),
+        "runs": runs,
+        "mse": float(np.mean((y - ref) ** 2)),
+        "max_abs": float(np.max(abs(y - ref))),
+        "residual_rms": float(np.sqrt(np.mean((dy - y @ matrix(N).T) ** 2))),
+        "physical_mse": float(np.mean((y - exact) ** 2)),
+    }
+
+
+def train_local():
+    out = {
+        "versions": {
+            "python": platform.python_version(),
+            "numpy": np.__version__,
+            "scipy": scipy.__version__,
+        },
+        "models": [],
+    }
+    # Original benchmark is refitted from its printed, rounded parameter vector.
+    x = np.linspace(0, 2, 41)
+    test = np.linspace(0, 2, 201)
+    initial = np.array([3.42346, 1.98998, -1.71461, 1.04958, -0.35142, 0.04778])
+
+    def scalar(th, t):
+        ph = np.polynomial.polynomial.polyval(t, th)
+        dph = np.polynomial.polynomial.polyval(t, np.arange(1, 6) * th[1:])
+        q = np.cos(ph)
+        y = 1 + t * (q - 1) / 2
+        dy = (q - 1) / 2 - t * np.sin(ph) * dph / 2
+        return y, dy, q
+
+    r = least_squares(
+        lambda th: sum(scalar(th, x)[:2]),
+        initial,
+        method="trf",
+        jac="3-point",
+        ftol=1e-13,
+        xtol=1e-13,
+        gtol=1e-13,
+        max_nfev=2000,
+    )
+    y, dy, q = scalar(r.x, test)
+    out["scalar"] = {
+        "theta": r.x.tolist(),
+        "mse": float(np.mean((y - np.exp(-test)) ** 2)),
+        "residual_rms": float(np.sqrt(np.mean((dy + y) ** 2))),
+        "nfev": r.nfev,
+    }
+    far = np.linspace(0, 6, 601)
+    yf, _, _ = scalar(r.x, far)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 3.3))
+    ax[0].plot(test, np.exp(-test), label="Exact")
+    ax[0].plot(test, y, "--", label="Residual-trained circuit")
+    ax[0].set(xlabel="x (dimensionless)", ylabel="y(x)")
+    ax[0].legend()
+    ax[1].plot(far, np.exp(-far), label="Exact")
+    ax[1].plot(far, yf, label="Same trained parameters")
+    ax[1].axvspan(0, 2, alpha=0.12, color="gray", label="Training interval")
+    ax[1].set(xlabel="x (dimensionless)", ylabel="y(x)", ylim=(-5, 1.2))
+    ax[1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(BASE / "figures/scalar.pdf")
+    plt.close(fig)
+    # Independent shot replicates, not hardware noise.
+    shot = []
+    rng = np.random.default_rng(20261102)
+    for S in [256, 1024, 4096, 16384]:
+        estimates = rng.binomial(S, (1 + q) / 2, size=(200, len(q))) * 2 / S - 1
+        ys = 1 + test[None, :] * (estimates - 1) / 2
+        vals = np.mean((ys - np.exp(-test)) ** 2, axis=1)
+        shot.append(
+            {
+                "shots": S,
+                "mean_mse": float(vals.mean()),
+                "sd_mse": float(vals.std(ddof=1)),
+                "predicted_mse": float(
+                    out["scalar"]["mse"] + np.mean(test**2 * (1 - q * q)) / (4 * S)
+                ),
+            }
+        )
+    out["shots"] = shot
+    for N, kind in [(1, "single"), (3, "single"), (3, "entangled"), (3, "product")]:
+        res = fit(N, kind)
+        out["models"].append(res)
+        (BASE / "results.json").write_text(json.dumps(out, indent=2))
+        print(N, kind, res["mse"], res["residual_rms"], flush=True)
+    out["closure"] = []
+    for N in [1, 2, 3, 5, 7]:
+        yy = classical(N, test)
+        xx = infinite(N, test)
+        out["closure"].append(
+            {
+                "N": N,
+                "all_mse": float(np.mean((yy - xx) ** 2)),
+                "m0_max": float(np.max(abs(yy[:, 0] - xx[:, 0]))),
+                "first_two_mse": float(np.mean((yy[:, :2] - xx[:, :2]) ** 2)),
+            }
+        )
+    fig, axs = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
+    model = out["models"][2]
+    v, d = evaluate(model["theta"], test, 4, "entangled")
+    ref = classical(3, test)
+    true = infinite(3, test)
+    for j, ax in enumerate(axs.flat):
+        ax.plot(test, true[:, j], label="Infinite hierarchy")
+        ax.plot(test, ref[:, j], "--", label="Classical P3")
+        ax.plot(test, v[:, j], ":", lw=2, label="Two-qubit ansatz")
+        ax.set(xlabel="t (dimensionless)", ylabel=f"M{j}(t)")
+        ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(BASE / "figures/hierarchy.pdf")
+    plt.close(fig)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 3.2))
+    for N in [1, 2, 3, 5]:
+        ax[0].semilogy(
+            test,
+            np.maximum(abs(classical(N, test)[:, 0] - infinite(N, test)[:, 0]), 1e-16),
+            label=f"P{N}",
+        )
+    ax[0].set(xlabel="t (dimensionless)", ylabel="Absolute closure error in M0")
+    ax[0].legend()
+    for mo in out["models"]:
+        if mo["N"] == 3:
+            yy, _ = evaluate(mo["theta"], test, 4, mo["kind"])
+            ax[1].semilogy(
+                test,
+                np.maximum(np.linalg.norm(yy - ref, axis=1), 1e-16),
+                label=mo["kind"],
+            )
+    ax[1].set(xlabel="t (dimensionless)", ylabel="Euclidean error against classical P3")
+    ax[1].legend()
+    fig.tight_layout()
+    fig.savefig(BASE / "figures/errors.pdf")
+    plt.close(fig)
+    # Entanglement before the final local rotation; concurrence is invariant under it.
+    th = np.asarray(model["theta"]).reshape(2, 3, 6)
+    V, _ = features(test, 5)
+    a, b, c = np.einsum("td,pgd->gtp", V, th)
+    con = abs(np.sin(a) * np.cos(b))
+    out["entanglement"] = {
+        "mean_concurrence": con.mean(axis=0).tolist(),
+        "max_concurrence": con.max(axis=0).tolist(),
+    }
+    # Explicit independent 4-amplitude statevector check of the analytic readouts.
+    maxdiff = 0
+    for p in range(2):
+        for ix in range(0, 201, 20):
+            aa, bb, cc = a[ix, p], b[ix, p], c[ix, p]
+            R = lambda z: np.array(
+                [[np.cos(z / 2), -np.sin(z / 2)], [np.sin(z / 2), np.cos(z / 2)]]
+            )
+            state = np.kron(R(aa)[:, 0], R(bb)[:, 0])
+            state = state[[0, 1, 3, 2]]
+            state = np.kron(R(cc), np.eye(2)) @ state
+            qq = np.array(
+                [np.dot(state**2, [1, 1, -1, -1]), np.dot(state**2, [1, -1, 1, -1])]
+            )
+            analytic = evaluate(
+                model["theta"], test[[ix]], 4, "entangled", return_q=True
+            )[0][0, 2 * p : 2 * p + 2]
+            maxdiff = max(maxdiff, float(np.max(abs(qq - analytic))))
+    out["checks"] = {"statevector_readout_max_error": maxdiff}
+    (BASE / "results.json").write_text(json.dumps(out, indent=2))
+    print("DONE", json.dumps(out["checks"]), flush=True)
+
+
+# ========================================================================
+# 2. INDEPENDENT QISKIT VERIFICATION AND JOINT SAMPLING
+# ========================================================================
+
+
+def circuit(a, b, c, entangled=True):
+    from qiskit import QuantumCircuit
+
+    qc = QuantumCircuit(2)
+    qc.ry(float(a), 0)
+    qc.ry(float(b), 1)
+    if entangled:
+        qc.cx(0, 1)
+    qc.ry(float(c), 0)
+    return qc
+
+
+def verify_local():
+    import qiskit
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import Statevector, SparsePauliOp
+
+    data = json.loads((BASE / "results.json").read_text())
+    mo = data["models"][2]
+    t = np.linspace(0, 2, 201)
+    V, _ = features(t, 5)
+    th = np.array(mo["theta"]).reshape(2, 3, 6)
+    angles = np.einsum("td,pgd->tpg", V, th)
+    q = evaluate(mo["theta"], t, 4, "entangled", return_q=True)[0]
+    probs = np.zeros((len(t), 2, 4))
+    maxerr = 0.0
+    obs = [SparsePauliOp("IZ"), SparsePauliOp("ZI")]
+    for i in range(len(t)):
+        for p in range(2):
+            st = Statevector.from_instruction(circuit(*angles[i, p]))
+            probs[i, p] = st.probabilities()
+            pred = np.array([st.expectation_value(o).real for o in obs])
+            maxerr = max(maxerr, float(np.max(abs(pred - q[i, 2 * p : 2 * p + 2]))))
+    data["checks"]["qiskit_readout_max_error"] = maxerr
+    data["versions"]["qiskit"] = qiskit.__version__
+    # Check time derivatives against centered differences at interior off-grid points.
+    tt = np.array([0.137, 0.731, 1.413, 1.917])
+    h = 1e-5
+    yp, _ = evaluate(mo["theta"], tt + h, 4, "entangled")
+    ym, _ = evaluate(mo["theta"], tt - h, 4, "entangled")
+    _, dy = evaluate(mo["theta"], tt, 4, "entangled")
+    data["checks"]["time_derivative_max_error"] = float(
+        np.max(abs((yp - ym) / (2 * h) - dy))
+    )
+    # Frozen-parameter joint measurement, keeping correlations between readouts.
+    eig = np.array([[1, 1], [-1, 1], [1, -1], [-1, -1]])
+    ref = classical(3, t)
+    rng = np.random.default_rng(8143)
+    rows = []
+    flip = 0.01
+    depol = 0.02
+    transition = np.array(
+        [
+            [
+                (1 - flip) ** (2 - (i ^ j).bit_count()) * flip ** ((i ^ j).bit_count())
+                for j in range(4)
+            ]
+            for i in range(4)
+        ]
+    )
+    for label, S in [
+        ("ideal shots", 1024),
+        ("ideal shots", 4096),
+        ("ideal shots", 16384),
+        ("illustrative noise", 4096),
+    ]:
+        P = (
+            probs
+            if label == "ideal shots"
+            else ((1 - depol) * probs + depol / 4) @ transition
+        )
+        errors = []
+        for repeat in range(200):
+            counts = np.array(
+                [[rng.multinomial(S, pp / pp.sum()) for pp in ppair] for ppair in P]
+            )
+            qh = (counts @ eig / S).reshape(len(t), 4)
+            yy = t[:, None] * qh
+            yy[:, 0] += 1
+            errors.append(np.mean((yy - ref) ** 2))
+        rows.append(
+            {
+                "model": label,
+                "shots": S,
+                "mean_mse": float(np.mean(errors)),
+                "sd_mse": float(np.std(errors, ddof=1)),
+            }
+        )
+    data["hierarchy_shots"] = rows
+    # Independent angle-by-angle parameter-shift check.
+    max_ps = 0.0
+    for ang in np.random.default_rng(47).uniform(-3, 3, (10, 3)):
+        for gate in range(3):
+            ap = ang.copy()
+            am = ang.copy()
+            ap[gate] += np.pi / 2
+            am[gate] -= np.pi / 2
+            bp = ang.copy()
+            bm = ang.copy()
+            bp[gate] += 1e-6
+            bm[gate] -= 1e-6
+            for obsname in ["IZ", "ZI"]:
+                op = SparsePauliOp(obsname)
+                ps = (
+                    Statevector(circuit(*ap)).expectation_value(op)
+                    - Statevector(circuit(*am)).expectation_value(op)
+                ).real / 2
+                fd = (
+                    Statevector(circuit(*bp)).expectation_value(op)
+                    - Statevector(circuit(*bm)).expectation_value(op)
+                ).real / (2e-6)
+                max_ps = max(max_ps, abs(ps - fd))
+    data["checks"]["parameter_shift_max_error"] = float(max_ps)
+    W = np.diag([1, 3, 5, 7])
+    A = matrix(3)
+    data["checks"]["dissipation_identity_max_error"] = float(
+        np.max(abs(W @ A + A.T @ W + 0.4 * W))
+    )
+    (BASE / "results.json").write_text(json.dumps(data, indent=2))
+    print(json.dumps({"checks": data["checks"], "shots": rows}, indent=2))
+    # Circuit diagram uses an actual representative input; parameter labels in report are general.
+    qc = circuit(*angles[100, 0])
+    (BASE / "circuit.txt").write_text(str(qc.draw(output="text")))
+
+
+# ========================================================================
+# 3. OFFLINE ANALYSIS OF THE ACTUAL IBM EXPERIMENT
+# ========================================================================
+
+
+def analyze_hardware():
+    base = BASE
+    m = json.loads((base / "hardware_data/main/ibm_result.json").read_text())
+    d = np.load(base / "hardware_data/main/ibm_values.npz", allow_pickle=False)
+    t = d["t"]
+    theta = np.asarray(m["theta"])
+    V = np.array([(t - 1) ** j for j in range(6)]).T
+    angles = np.einsum("td,pgd->tpg", V, theta)
+    q = np.empty((len(t), 4))
+    for p in range(2):
+        a, b, c = angles[:, p, :].T
+        q[:, 2 * p] = np.cos(a) * np.cos(c) - np.sin(a) * np.sin(b) * np.sin(c)
+        q[:, 2 * p + 1] = np.cos(a) * np.cos(b)
+    yideal = t[:, None] * q
+    yideal[:, 0] += 1
+    A = np.diag([-0.2] * 4)
+    for l in range(4):
+        if l:
+            A[l, l - 1] = l / (2 * l + 1)
+        if l < 3:
+            A[l, l + 1] = -(l + 1) / (2 * l + 1)
+    ref = np.array([expm(A * x)[:, 0] for x in t])
+    y = d["moments"]
+    err = y - ref
+    se = d["moment_stds"]
+    assert np.allclose(ref, d["classical"], atol=1e-14)
+    assert np.allclose(y, t[:, None] * d["expectations"] + np.array([1, 0, 0, 0]))
+    assert np.allclose(se, t[:, None] * d["stds"])
+    assert np.isclose(np.mean(err**2), m["mse_against_P3"])
+    shots = np.array([x["shots"] for x in m["pub_metadata"]]).reshape(len(t), 2)
+    S = np.repeat(shots, 2, axis=1)
+    ideal_mse = float(np.mean((yideal - ref) ** 2))
+    expected_shot_mse = ideal_mse + float(np.mean(t[:, None] ** 2 * (1 - q * q) / S))
+    stats = {
+        "job_id": m["job_id"],
+        "mse": float(np.mean(err**2)),
+        "rmse": float(np.sqrt(np.mean(err**2))),
+        "mse_excluding_initial": float(np.mean(err[1:] ** 2)),
+        "ideal_same_grid_mse": ideal_mse,
+        "expected_ideal_shot_mse": expected_shot_mse,
+        "hardware_to_shot_ratio": float(np.mean(err**2) / expected_shot_mse),
+        "mean_estimated_sampling_variance": float(np.mean(se**2)),
+        "per_moment_mse": np.mean(err**2, axis=0).tolist(),
+        "per_moment_rmse": np.sqrt(np.mean(err**2, axis=0)).tolist(),
+        "per_moment_max_absolute_error": np.max(abs(err), axis=0).tolist(),
+        "per_moment_mean_signed_error": np.mean(err, axis=0).tolist(),
+    }
+    (base / "hardware_analysis.json").write_text(json.dumps(stats, indent=2))
+    with (base / "hardware_comparison.csv").open("w") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "t",
+                "moment",
+                "ideal",
+                "classical_P3",
+                "IBM",
+                "standard_error",
+                "difference",
+            ]
+        )
+        for i, x in enumerate(t):
+            for l in range(4):
+                w.writerow(
+                    [x, l, yideal[i, l], ref[i, l], y[i, l], se[i, l], err[i, l]]
+                )
+    plt.rcParams.update(
+        {"font.size": 10, "axes.spines.top": False, "axes.spines.right": False}
+    )
+    fig, axs = plt.subplots(2, 2, figsize=(9, 6), sharex=True)
+    for l, ax in enumerate(axs.flat):
+        ax.plot(t, ref[:, l], color="#234e70", label="Classical P3 / ideal circuit")
+        ax.errorbar(
+            t,
+            y[:, l],
+            yerr=se[:, l],
+            fmt="o",
+            ms=3,
+            capsize=2,
+            color="#c65924",
+            label="IBM fez: 1 standard error",
+        )
+        ax.set(ylabel=f"$M_{l}(t)$")
+        ax.grid(alpha=0.15)
+        if l >= 2:
+            ax.set_xlabel("t (dimensionless)")
+    axs[0, 0].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(base / "ibm_moments.pdf")
+    plt.close(fig)
+    fig, axs = plt.subplots(2, 2, figsize=(9, 5.5), sharex=True)
+    for l, ax in enumerate(axs.flat):
+        ax.axhline(0, color="#234e70", lw=1)
+        ax.errorbar(
+            t, err[:, l], yerr=se[:, l], fmt="o", ms=3, capsize=2, color="#c65924"
+        )
+        ax.set(ylabel=f"$M_{l}^{{IBM}}-M_{l}^{{P_3}}$")
+        ax.grid(alpha=0.15)
+        if l >= 2:
+            ax.set_xlabel("t (dimensionless)")
+    fig.tight_layout()
+    fig.savefig(base / "ibm_errors.pdf")
+    plt.close(fig)
+    print(json.dumps(stats, indent=2))
+
+
+# ========================================================================
+# 4. EXPLICIT IBM SUBMISSION AND RESUME
+# ========================================================================
+
+
+def save_result(result, manifest, folder):
+    t = np.asarray(manifest["times"])
+    evs = np.asarray([np.asarray(r.data.evs).ravel() for r in result]).reshape(
+        len(t), 4
+    )
+    stds = np.asarray([np.asarray(r.data.stds).ravel() for r in result]).reshape(
+        len(t), 4
+    )
+    y = t[:, None] * evs
+    y[:, 0] += 1
+    ref = classical(3, t)
+    manifest.update(
+        completed_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        mse_against_P3=float(np.mean((y - ref) ** 2)),
+        pub_metadata=[r.metadata for r in result],
+        result_metadata=result.metadata,
+    )
+    np.savez(
+        folder / "ibm_values.npz",
+        t=t,
+        expectations=evs,
+        stds=stds,
+        moment_stds=t[:, None] * stds,
+        moments=y,
+        classical=ref,
+    )
+    (folder / "ibm_result.json").write_text(json.dumps(manifest, indent=2, default=str))
+    print("MSE against finite P3 reference:", manifest["mse_against_P3"])
+    print("Results saved in:", folder)
+
+
+def run_hardware(args):
+    from qiskit_ibm_runtime import QiskitRuntimeService
+
+    service = (
+        QiskitRuntimeService(name=args.account)
+        if args.account
+        else QiskitRuntimeService()
+    )
+    if args.resume:
+        path = args.resume.resolve()
+        manifest = json.loads(path.read_text())
+        job = service.job(manifest["job_id"])
+        print("Existing job status:", job.status(), flush=True)
+        save_result(job.result(), manifest, path.parent)
+        return
+    from qiskit import QuantumCircuit, qpy
+    from qiskit.circuit import ParameterVector
+    from qiskit.quantum_info import SparsePauliOp
+    from qiskit.transpiler import generate_preset_pass_manager
+
+    try:
+        from qiskit_ibm_runtime.server_side import EstimatorV2 as Estimator
+    except ImportError:
+        from qiskit_ibm_runtime import EstimatorV2 as Estimator
+    base = BASE
+    raw = (base / "results.json").read_bytes()
+    model = json.loads(raw)["models"][2]
+    backend = (
+        service.backend(args.backend)
+        if args.backend
+        else service.least_busy(operational=True, simulator=False, min_num_qubits=2)
+    )
+    if backend.configuration().simulator:
+        raise ValueError("A real QPU is required.")
+    p = ParameterVector("angle", 3)
+    qc = QuantumCircuit(2)
+    qc.ry(p[0], 0)
+    qc.ry(p[1], 1)
+    qc.cx(0, 1)
+    qc.ry(p[2], 0)
+    isa = generate_preset_pass_manager(
+        optimization_level=1, backend=backend, seed_transpiler=71
+    ).run(qc)
+    observables = [SparsePauliOp(s).apply_layout(isa.layout) for s in ["IZ", "ZI"]]
+    t = np.linspace(0, 2, args.points)
+    V, _ = features(t, 5)
+    theta = np.asarray(model["theta"]).reshape(2, 3, 6)
+    angles = np.einsum("td,pgd->tpg", V, theta)
+    pubs = []
+    for i in range(len(t)):
+        for pair in range(2):
+            mapping = dict(zip(p, angles[i, pair]))
+            pubs.append(
+                (isa, observables, [mapping[param] for param in isa.parameters])
+            )
+    options = {
+        "resilience_level": 0,
+        "max_execution_time": args.max_seconds,
+        "twirling": {"enable_gates": False, "enable_measure": False},
+        "dynamical_decoupling": {"enable": False},
+    }
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    folder = base / "ibm_runs" / stamp
+    folder.mkdir(parents=True)
+    with (folder / "isa_circuit.qpy").open("wb") as f:
+        qpy.dump(isa, f)
+    manifest = {
+        "backend": backend.name,
+        "times": t.tolist(),
+        "theta": theta.tolist(),
+        "results_sha256": hashlib.sha256(raw).hexdigest(),
+        "precision_requested": args.precision,
+        "options": options,
+        "optimization_level": 1,
+        "seed_transpiler": 71,
+        "isa_depth": isa.depth(),
+        "isa_ops": dict(isa.count_ops()),
+        "final_index_layout": isa.layout.final_index_layout(),
+        "versions": {
+            n: importlib.metadata.version(n) for n in ["qiskit", "qiskit-ibm-runtime"]
+        },
+    }
+    (folder / "planned_run.json").write_text(
+        json.dumps(manifest, indent=2, default=str)
+    )
+    print("Submitting", len(pubs), "PUBs to", backend.name, flush=True)
+    job = Estimator(mode=backend, options=options).run(pubs, precision=args.precision)
+    manifest.update(
+        job_id=job.job_id(),
+        submitted_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    )
+    path = folder / "ibm_submission.json"
+    path.write_text(json.dumps(manifest, indent=2, default=str))
+    print("Submitted job:", job.job_id(), "\nResume manifest:", path, flush=True)
+    save_result(job.result(), manifest, folder)
+
+
+# ========================================================================
+# 5. RECREATE LOCAL FIGURES FROM SAVED COEFFICIENTS
+# ========================================================================
+
+
+def plot_saved_results():
+    out = json.loads((BASE / "results.json").read_text())
+    test = np.linspace(0, 2, 201)
+    far = np.linspace(0, 6, 601)
+    theta = np.asarray(out["scalar"]["theta"])
+
+    def scalar_curve(x):
+        q = np.cos(np.polynomial.polynomial.polyval(x, theta))
+        return 1 + x * (q - 1) / 2
+
+    y = scalar_curve(test)
+    yf = scalar_curve(far)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 3.3))
+    ax[0].plot(test, np.exp(-test), label="Exact")
+    ax[0].plot(test, y, "--", label="Residual-trained circuit")
+    ax[0].set(xlabel="x (dimensionless)", ylabel="y(x)")
+    ax[0].legend()
+    ax[1].plot(far, np.exp(-far), label="Exact")
+    ax[1].plot(far, yf, label="Same trained parameters")
+    ax[1].axvspan(0, 2, alpha=0.12, color="gray", label="Training interval")
+    ax[1].set(xlabel="x (dimensionless)", ylabel="y(x)", ylim=(-5, 1.2))
+    ax[1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(BASE / "figures/scalar.pdf")
+    plt.close(fig)
+    fig, axs = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
+    model = out["models"][2]
+    v, d = evaluate(model["theta"], test, 4, "entangled")
+    ref = classical(3, test)
+    true = infinite(3, test)
+    for j, ax in enumerate(axs.flat):
+        ax.plot(test, true[:, j], label="Infinite hierarchy")
+        ax.plot(test, ref[:, j], "--", label="Classical P3")
+        ax.plot(test, v[:, j], ":", lw=2, label="Two-qubit ansatz")
+        ax.set(xlabel="t (dimensionless)", ylabel=f"M{j}(t)")
+        ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(BASE / "figures/hierarchy.pdf")
+    plt.close(fig)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 3.2))
+    for N in [1, 2, 3, 5]:
+        ax[0].semilogy(
+            test,
+            np.maximum(abs(classical(N, test)[:, 0] - infinite(N, test)[:, 0]), 1e-16),
+            label=f"P{N}",
+        )
+    ax[0].set(xlabel="t (dimensionless)", ylabel="Absolute closure error in M0")
+    ax[0].legend()
+    for mo in out["models"]:
+        if mo["N"] == 3:
+            yy, _ = evaluate(mo["theta"], test, 4, mo["kind"])
+            ax[1].semilogy(
+                test,
+                np.maximum(np.linalg.norm(yy - ref, axis=1), 1e-16),
+                label=mo["kind"],
+            )
+    ax[1].set(xlabel="t (dimensionless)", ylabel="Euclidean error against classical P3")
+    ax[1].legend()
+    fig.tight_layout()
+    fig.savefig(BASE / "figures/errors.pdf")
+    plt.close(fig)
+
+
+# ========================================================================
+# 6. ARCHIVE RESTORATION AND COMMAND-LINE ENTRY POINT
+# ========================================================================
+
+
+def restore_archives():
+    BASE.mkdir(parents=True, exist_ok=True)
+    (BASE / "figures").mkdir(exist_ok=True)
+    for name in ("results.json", "report_reference_results.json"):
+        (BASE / name).write_text(json.dumps(ARCHIVED_LOCAL_RESULTS, indent=2))
+    for name, entry in ARCHIVED_IBM_RUNS.items():
+        folder = BASE / "hardware_data" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "ibm_result.json").write_text(json.dumps(entry["metadata"], indent=2))
+        np.savez(
+            folder / "ibm_values.npz",
+            **{k: np.asarray(v) for k, v in entry["arrays"].items()},
+        )
+
+
+def main():
+    global BASE
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
+        "--retrain",
+        action="store_true",
+        help="Repeat local fitting; may take several minutes.",
+    )
+    action.add_argument(
+        "--analyze-only",
+        action="store_true",
+        help="Analyze embedded IBM measurements only.",
+    )
+    action.add_argument(
+        "--execute", action="store_true", help="Submit a NEW real QPU job."
+    )
+    action.add_argument(
+        "--resume", type=Path, help="Retrieve an existing job using its saved manifest."
+    )
+    parser.add_argument("--output-dir", type=Path, default=BASE)
+    parser.add_argument("--account", help="Optional named locally saved IBM account.")
+    parser.add_argument("--backend")
+    parser.add_argument("--points", type=int, default=21)
+    parser.add_argument("--precision", type=float, default=1 / 64)
+    parser.add_argument("--max-seconds", type=int, default=120)
+    args = parser.parse_args()
+    if (
+        args.points < 2
+        or not np.isfinite(args.precision)
+        or args.precision <= 0
+        or args.max_seconds <= 0
+    ):
+        parser.error("Require points >= 2, finite precision > 0 and max-seconds > 0.")
+    if not (args.execute or args.resume or args.analyze_only):
+        try:
+            import qiskit
+        except ImportError:
+            parser.error(
+                "Install qiskit, or use --analyze-only for offline IBM analysis without it."
+            )
+    BASE = args.output_dir.expanduser().resolve()
+    restore_archives()
+    print("Output directory:", BASE, flush=True)
+    if args.execute or args.resume:
+        run_hardware(args)
+        return
+    if not args.analyze_only:
+        if args.retrain:
+            print("Retraining locally; no QPU job is submitted.", flush=True)
+            train_local()
+        else:
+            print(
+                "Using archived trained coefficients; no retraining and no QPU submission.",
+                flush=True,
+            )
+            plot_saved_results()
+        verify_local()
+    print("Analyzing archived real IBM measurements.", flush=True)
+    analyze_hardware()
+
+
+# ========================================================================
+# 7. RECORDED DATA — NOT NEW COMPUTATION OR SYNTHETIC HARDWARE RESULTS
+# ========================================================================
+
+ARCHIVED_LOCAL_RESULTS = {
+    "versions": {
+        "python": "3.12.14",
+        "numpy": "2.3.5",
+        "scipy": "1.17.0",
+        "qiskit": "2.6.1",
+    },
+    "models": [
+        {
+            "N": 1,
+            "kind": "single",
+            "degree": 5,
+            "parameters": 12,
+            "theta": [
+                1.8901739994820017,
+                0.0855525145116286,
+                -0.032714377046347054,
+                0.00033502906566489863,
+                0.0005820253167282125,
+                -3.991435300619273e-06,
+                1.3098455137531742,
+                0.08375952038897207,
+                0.0018066549892811687,
+                -0.0028116622326150023,
+                0.0002609919402343246,
+                4.152361281144345e-06,
+            ],
+            "runs": [
+                {
+                    "seed": 11,
+                    "loss": 1.9092113235545565e-12,
+                    "nfev": 5,
+                    "optimality": 3.876444347639021e-11,
+                    "status": 3,
+                    "seconds": 0.009193729999878997,
+                },
+                {
+                    "seed": 22,
+                    "loss": 1.9092113235469806e-12,
+                    "nfev": 5,
+                    "optimality": 8.045989682891122e-15,
+                    "status": 1,
+                    "seconds": 0.008666488000017125,
+                },
+                {
+                    "seed": 33,
+                    "loss": 1.9092113234193746e-12,
+                    "nfev": 4,
+                    "optimality": 7.599171299003688e-12,
+                    "status": 1,
+                    "seconds": 0.007018128999789042,
+                },
+            ],
+            "mse": 2.9755567198235716e-14,
+            "max_abs": 3.7461472768285375e-07,
+            "residual_rms": 1.2969793099857408e-06,
+            "physical_mse": 0.0004241580136280747,
+        },
+        {
+            "N": 3,
+            "kind": "single",
+            "degree": 5,
+            "parameters": 24,
+            "theta": [
+                1.8871064028532587,
+                0.07712210827026293,
+                -0.039528599772867545,
+                -0.0002367508722749295,
+                0.0014251230967136656,
+                -4.86228131022366e-05,
+                1.3216496291490394,
+                0.10328549273973198,
+                0.005461427034283019,
+                -0.0067053022725184885,
+                0.0005241650244144698,
+                8.579221084937466e-05,
+                1.5199940701524868,
+                -0.03325384535746394,
+                0.01838972752910951,
+                2.7673738083063235e-05,
+                -0.0007558371362488885,
+                6.053063292565058e-05,
+                1.563327043953522,
+                -0.012799410713696802,
+                -0.0031726973193233966,
+                0.0021132835581843903,
+                -9.048637092349834e-05,
+                -4.4399257817102546e-05,
+            ],
+            "runs": [
+                {
+                    "seed": 11,
+                    "loss": 1.2369422793487382e-11,
+                    "nfev": 5,
+                    "optimality": 1.0357395890503388e-14,
+                    "status": 1,
+                    "seconds": 0.018392027000118105,
+                },
+                {
+                    "seed": 22,
+                    "loss": 1.2369422793475564e-11,
+                    "nfev": 5,
+                    "optimality": 9.54548681545949e-15,
+                    "status": 1,
+                    "seconds": 0.016464779999751045,
+                },
+                {
+                    "seed": 33,
+                    "loss": 1.2369422793519385e-11,
+                    "nfev": 5,
+                    "optimality": 1.1230765272535919e-14,
+                    "status": 1,
+                    "seconds": 0.01660565200018027,
+                },
+            ],
+            "mse": 2.011001321603344e-13,
+            "max_abs": 1.1328859076398246e-06,
+            "residual_rms": 3.3021053921663642e-06,
+            "physical_mse": 1.3335926135491953e-07,
+        },
+        {
+            "N": 3,
+            "kind": "entangled",
+            "degree": 5,
+            "parameters": 36,
+            "theta": [
+                1.2134884016147465,
+                0.05209028805226058,
+                0.015099158058442854,
+                -0.0018621951713157087,
+                -0.0002524591071452053,
+                -8.491242247734204e-05,
+                0.7883700105634536,
+                0.264851674004387,
+                -0.012831738766241855,
+                -0.0015915832770239523,
+                0.000810876207656334,
+                1.771484157133877e-05,
+                0.9117042978448544,
+                -0.153773661947215,
+                -0.01731699316954488,
+                0.003706430723787734,
+                0.0002261394073382022,
+                8.430277007464727e-05,
+                1.5587969253837375,
+                -0.02314904239726647,
+                -0.0102594029925758,
+                0.0008917385042664382,
+                -3.73409831062473e-05,
+                -3.883161764608391e-05,
+                0.8988873394956293,
+                0.17131742021429414,
+                -0.00010836487062610769,
+                -0.0015619099841096416,
+                -1.7424026980491627e-05,
+                -1.6904658740366887e-05,
+                -0.04959500584876058,
+                -0.006169136668309657,
+                0.0367449147737042,
+                -0.006269148138949346,
+                0.00044514193531575055,
+                3.327722238818588e-05,
+            ],
+            "runs": [
+                {
+                    "seed": 11,
+                    "loss": 1.0135262242117441e-14,
+                    "nfev": 700,
+                    "optimality": 9.081163918034641e-07,
+                    "status": 0,
+                    "seconds": 5.46156535099999,
+                },
+                {
+                    "seed": 22,
+                    "loss": 3.403404412595763e-16,
+                    "nfev": 700,
+                    "optimality": 7.208867638174678e-08,
+                    "status": 0,
+                    "seconds": 5.916591501000312,
+                },
+                {
+                    "seed": 33,
+                    "loss": 6.786898180138617e-14,
+                    "nfev": 700,
+                    "optimality": 1.1526606767677715e-06,
+                    "status": 0,
+                    "seconds": 5.880312851999861,
+                },
+            ],
+            "mse": 3.354740341758269e-18,
+            "max_abs": 5.079494713733368e-09,
+            "residual_rms": 1.758509973283552e-08,
+            "physical_mse": 1.3336486871586084e-07,
+        },
+        {
+            "N": 3,
+            "kind": "product",
+            "degree": 5,
+            "parameters": 36,
+            "theta": [
+                -0.5672416118733632,
+                -4.0761991832799644,
+                5.128369176214713,
+                -2.0360478384683636,
+                3.107783513098839,
+                -6.8923392516696325,
+                1.3216496291490394,
+                0.10328549273973044,
+                0.0054614270342854205,
+                -0.006705302272516945,
+                0.0005241650244107828,
+                8.579221085044354e-05,
+                2.45434801472662,
+                4.153321291550231,
+                -5.16789777598756,
+                2.0358110875960578,
+                -3.1063583900021503,
+                6.892290628856562,
+                0.4286444230974494,
+                -1.4562201135178379,
+                -4.077610804808962,
+                -3.1965347469825263,
+                -3.96970807231675,
+                -1.7185019031104387,
+                1.563327043953522,
+                -0.012799410713696656,
+                -0.003172697319324037,
+                0.0021132835581848305,
+                -9.048637092278865e-05,
+                -4.43992578176984e-05,
+                1.0913496470550377,
+                1.4229662681603732,
+                4.0960005323380715,
+                3.196562420720612,
+                3.9689522351805,
+                1.7185624337433638,
+            ],
+            "runs": [
+                {
+                    "seed": 11,
+                    "loss": 1.236942279297382e-11,
+                    "nfev": 26,
+                    "optimality": 8.843313400492972e-14,
+                    "status": 1,
+                    "seconds": 0.07379875700007688,
+                },
+                {
+                    "seed": 22,
+                    "loss": 1.23694227909165e-11,
+                    "nfev": 16,
+                    "optimality": 7.27138059273329e-14,
+                    "status": 1,
+                    "seconds": 0.05593174799969347,
+                },
+                {
+                    "seed": 33,
+                    "loss": 1.2369422792033008e-11,
+                    "nfev": 14,
+                    "optimality": 9.074737819047606e-12,
+                    "status": 1,
+                    "seconds": 0.05165099399982864,
+                },
+            ],
+            "mse": 2.011001320540069e-13,
+            "max_abs": 1.1328859069736907e-06,
+            "residual_rms": 3.302105391911021e-06,
+            "physical_mse": 1.333592613549549e-07,
+        },
+    ],
+    "scalar": {
+        "theta": [
+            3.423455373433531,
+            1.9899784332001167,
+            -1.7146090615578222,
+            1.049581833498304,
+            -0.3514197538060677,
+            0.047784274855334125,
+        ],
+        "mse": 9.278545577247466e-08,
+        "residual_rms": 0.003363686760315317,
+        "nfev": 5,
+    },
+    "shots": [
+        {
+            "shots": 256,
+            "mean_mse": 0.0012578051542883877,
+            "sd_mse": 0.00017642839546488725,
+            "predicted_mse": 0.0012621351814957012,
+        },
+        {
+            "shots": 1024,
+            "mean_mse": 0.00031439231268529653,
+            "sd_mse": 4.0729262373997985e-05,
+            "predicted_mse": 0.00031560338446575466,
+        },
+        {
+            "shots": 4096,
+            "mean_mse": 7.88350703452043e-05,
+            "sd_mse": 1.0883126445249578e-05,
+            "predicted_mse": 7.897043520826802e-05,
+        },
+        {
+            "shots": 16384,
+            "mean_mse": 1.9677679975706785e-05,
+            "sd_mse": 2.7201742660681187e-06,
+            "predicted_mse": 1.981219789389636e-05,
+        },
+    ],
+    "closure": [
+        {
+            "N": 1,
+            "all_mse": 0.0004241568758809619,
+            "m0_max": 0.033821836781687264,
+            "first_two_mse": 0.0004241568758809619,
+        },
+        {
+            "N": 2,
+            "all_mse": 7.571954769369123e-06,
+            "m0_max": 0.0012042016211303297,
+            "first_two_mse": 6.918284197787224e-07,
+        },
+        {
+            "N": 3,
+            "all_mse": 1.3336479905932213e-07,
+            "m0_max": 2.2373927228369617e-05,
+            "first_two_mse": 3.001083032063519e-10,
+        },
+        {
+            "N": 5,
+            "all_mse": 2.4377956849558243e-11,
+            "m0_max": 1.9700231446151406e-09,
+            "first_two_mse": 3.352943960482164e-18,
+        },
+        {
+            "N": 7,
+            "all_mse": 2.112485716308697e-15,
+            "m0_max": 4.596323321948148e-14,
+            "first_two_mse": 2.4433849902927185e-27,
+        },
+    ],
+    "entanglement": {
+        "mean_concurrence": [0.6552972993616546, 0.6193637704814839],
+        "max_concurrence": [0.8049533212760588, 0.745825614849422],
+    },
+    "checks": {
+        "statevector_readout_max_error": 2.7755575615628914e-16,
+        "qiskit_readout_max_error": 4.440892098500626e-16,
+        "time_derivative_max_error": 1.9934817685474115e-11,
+        "parameter_shift_max_error": 2.0526014221644573e-10,
+        "dissipation_identity_max_error": 0.0,
+    },
+    "hierarchy_shots": [
+        {
+            "model": "ideal shots",
+            "shots": 1024,
+            "mean_mse": 0.0012524034581943514,
+            "sd_mse": 9.011351171896517e-05,
+        },
+        {
+            "model": "ideal shots",
+            "shots": 4096,
+            "mean_mse": 0.0003138662424623077,
+            "sd_mse": 2.4433119754964674e-05,
+        },
+        {
+            "model": "ideal shots",
+            "shots": 16384,
+            "mean_mse": 7.921672571025932e-05,
+            "sd_mse": 5.829719329765514e-06,
+        },
+        {
+            "model": "illustrative noise",
+            "shots": 4096,
+            "mean_mse": 0.00039601526830963053,
+            "sd_mse": 2.4447696874943024e-05,
+        },
+    ],
+}
+
+ARCHIVED_IBM_RUNS = {
+    "main": {
+        "metadata": {
+            "backend": "ibm_fez",
+            "times": [
+                0.0,
+                0.1,
+                0.2,
+                0.30000000000000004,
+                0.4,
+                0.5,
+                0.6000000000000001,
+                0.7000000000000001,
+                0.8,
+                0.9,
+                1.0,
+                1.1,
+                1.2000000000000002,
+                1.3,
+                1.4000000000000001,
+                1.5,
+                1.6,
+                1.7000000000000002,
+                1.8,
+                1.9000000000000001,
+                2.0,
+            ],
+            "theta": [
+                [
+                    [
+                        1.2134884016147465,
+                        0.05209028805226058,
+                        0.015099158058442854,
+                        -0.0018621951713157087,
+                        -0.0002524591071452053,
+                        -8.491242247734204e-05,
+                    ],
+                    [
+                        0.7883700105634536,
+                        0.264851674004387,
+                        -0.012831738766241855,
+                        -0.0015915832770239523,
+                        0.000810876207656334,
+                        1.771484157133877e-05,
+                    ],
+                    [
+                        0.9117042978448544,
+                        -0.153773661947215,
+                        -0.01731699316954488,
+                        0.003706430723787734,
+                        0.0002261394073382022,
+                        8.430277007464727e-05,
+                    ],
+                ],
+                [
+                    [
+                        1.5587969253837375,
+                        -0.02314904239726647,
+                        -0.0102594029925758,
+                        0.0008917385042664382,
+                        -3.73409831062473e-05,
+                        -3.883161764608391e-05,
+                    ],
+                    [
+                        0.8988873394956293,
+                        0.17131742021429414,
+                        -0.00010836487062610769,
+                        -0.0015619099841096416,
+                        -1.7424026980491627e-05,
+                        -1.6904658740366887e-05,
+                    ],
+                    [
+                        -0.04959500584876058,
+                        -0.006169136668309657,
+                        0.0367449147737042,
+                        -0.006269148138949346,
+                        0.00044514193531575055,
+                        3.327722238818588e-05,
+                    ],
+                ],
+            ],
+            "results_sha256": "1a5dc30e07f4951f772897465555878975a8fc2f2a7c66fbc9d5f00ee22c8f58",
+            "precision_requested": 0.015625,
+            "options": {
+                "resilience_level": 0,
+                "max_execution_time": 120,
+                "twirling": {"enable_gates": False, "enable_measure": False},
+                "dynamical_decoupling": {"enable": False},
+            },
+            "optimization_level": 1,
+            "seed_transpiler": 71,
+            "isa_depth": 9,
+            "isa_ops": {"rz": 8, "sx": 7, "cz": 1},
+            "final_index_layout": [0, 1],
+            "versions": {"qiskit": "2.6.2", "qiskit-ibm-runtime": "0.52.1"},
+            "job_id": "dbu7dhpjbrss73a7cms0",
+            "submitted_utc": "2026-11-17T15:46:15.217693+00:00",
+            "completed_utc": "2026-11-17T15:47:12.591659+00:00",
+            "mse_against_P3": 0.0024725397192914187,
+            "pub_metadata": [
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 4096,
+                    "target_precision": 0.015625,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+            ],
+            "result_metadata": {
+                "dynamical_decoupling": {
+                    "enable": False,
+                    "sequence_type": "XX",
+                    "extra_slack_distribution": "middle",
+                    "scheduling_method": "alap",
+                },
+                "twirling": {
+                    "enable_gates": False,
+                    "enable_measure": False,
+                    "num_randomizations": "auto",
+                    "shots_per_randomization": "auto",
+                    "interleave_randomizations": True,
+                    "strategy": "active-accum",
+                },
+                "resilience": {
+                    "measure_mitigation": False,
+                    "zne_mitigation": False,
+                    "pec_mitigation": False,
+                },
+                "version": 2,
+            },
+        },
+        "arrays": {
+            "t": [
+                0.0,
+                0.1,
+                0.2,
+                0.30000000000000004,
+                0.4,
+                0.5,
+                0.6000000000000001,
+                0.7000000000000001,
+                0.8,
+                0.9,
+                1.0,
+                1.1,
+                1.2000000000000002,
+                1.3,
+                1.4000000000000001,
+                1.5,
+                1.6,
+                1.7000000000000002,
+                1.8,
+                1.9000000000000001,
+                2.0,
+            ],
+            "expectations": [
+                [-0.14697265625, 0.2880859375, 0.03271484375, -0.00341796875],
+                [-0.1455078125, 0.28759765625, 0.0517578125, 0.03515625],
+                [-0.19287109375, 0.27197265625, 0.0546875, 0.00537109375],
+                [-0.17919921875, 0.2626953125, 0.05419921875, -0.00732421875],
+                [-0.18115234375, 0.30078125, 0.03857421875, -0.01416015625],
+                [-0.18798828125, 0.27294921875, 0.05908203125, -0.0107421875],
+                [-0.21728515625, 0.2392578125, 0.06103515625, 0.009765625],
+                [-0.2236328125, 0.23046875, 0.041015625, 0.00390625],
+                [-0.21044921875, 0.27001953125, 0.05224609375, 0.01318359375],
+                [-0.2314453125, 0.220703125, 0.107421875, 0.0126953125],
+                [-0.23828125, 0.22216796875, 0.06787109375, 0.00732421875],
+                [-0.2236328125, 0.216796875, 0.07080078125, 0.02392578125],
+                [-0.27001953125, 0.18994140625, 0.046875, 0.0048828125],
+                [-0.23291015625, 0.21923828125, 0.0859375, 0.0048828125],
+                [-0.25146484375, 0.20947265625, 0.06005859375, -0.0107421875],
+                [-0.25634765625, 0.1552734375, 0.0869140625, -0.001953125],
+                [-0.27294921875, 0.16650390625, 0.087890625, -0.0009765625],
+                [-0.27490234375, 0.16064453125, 0.0732421875, 0.001953125],
+                [-0.271484375, 0.14111328125, 0.115234375, 0.03466796875],
+                [-0.2861328125, 0.13916015625, 0.10107421875, 0.0244140625],
+                [-0.26220703125, 0.1328125, 0.06298828125, 0.001953125],
+            ],
+            "stds": [
+                [
+                    0.015455321177949649,
+                    0.014962571244141897,
+                    0.015616636347503243,
+                    0.015624908730121121,
+                ],
+                [
+                    0.015458704728412417,
+                    0.01496486435181552,
+                    0.015604057283987914,
+                    0.015615341062103785,
+                ],
+                [
+                    0.015331626616441461,
+                    0.015036015310222906,
+                    0.015601617483501556,
+                    0.015624774618311441,
+                ],
+                [
+                    0.01537207511558625,
+                    0.015076231849986996,
+                    0.01560203347034883,
+                    0.015624580899220768,
+                ],
+                [
+                    0.015366485100510443,
+                    0.014901455594015617,
+                    0.015613370904075745,
+                    0.015623433436897658,
+                ],
+                [
+                    0.015346426113629887,
+                    0.015031694412477217,
+                    0.015597705172125992,
+                    0.015624098453738631,
+                ],
+                [
+                    0.015251690166916276,
+                    0.015171188668481994,
+                    0.015595869013884,
+                    0.015624254924175893,
+                ],
+                [
+                    0.01522927290503875,
+                    0.015204370735780355,
+                    0.015611851643690269,
+                    0.015624880790255698,
+                ],
+                [
+                    0.015275074850914918,
+                    0.015044606954776633,
+                    0.015603660003031395,
+                    0.01562364207267928,
+                ],
+                [
+                    0.015200748684739373,
+                    0.015239703640318436,
+                    0.01553458638689129,
+                    0.015623740801140503,
+                ],
+                [
+                    0.015174940520457508,
+                    0.015234506358900817,
+                    0.015588970292597613,
+                    0.015624580899220768,
+                ],
+                [
+                    0.01522927290503875,
+                    0.015253386494748066,
+                    0.015585788684865914,
+                    0.015620527148791963,
+                ],
+                [
+                    0.015044606954776633,
+                    0.015340553560511212,
+                    0.015607824422289657,
+                    0.01562481373437484,
+                ],
+                [
+                    0.015195285259580344,
+                    0.01524486478628735,
+                    0.015567195781371302,
+                    0.01562481373437484,
+                ],
+                [
+                    0.015122913017478663,
+                    0.01527835164138542,
+                    0.015596794584081697,
+                    0.015624098453738631,
+                ],
+                [
+                    0.015102885103870901,
+                    0.015435492654845407,
+                    0.01556587207552528,
+                    0.01562497019764919,
+                ],
+                [
+                    0.015031694412477217,
+                    0.01540688742028451,
+                    0.015564533298059523,
+                    0.015624992549417627,
+                ],
+                [
+                    0.015023002393926427,
+                    0.015422067616732375,
+                    0.015583034127840668,
+                    0.01562497019764919,
+                ],
+                [
+                    0.015038169487535853,
+                    0.015468647741572186,
+                    0.015520911413888153,
+                    0.015615607582842726,
+                ],
+                [
+                    0.014971718240501287,
+                    0.015472966998682045,
+                    0.015544982629051692,
+                    0.01562034269303066,
+                ],
+                [
+                    0.015078306935131819,
+                    0.015486580946580107,
+                    0.015593972916314142,
+                    0.01562497019764919,
+                ],
+            ],
+            "moment_stds": [
+                [0.0, 0.0, 0.0, 0.0],
+                [
+                    0.0015458704728412418,
+                    0.0014964864351815522,
+                    0.0015604057283987915,
+                    0.0015615341062103787,
+                ],
+                [
+                    0.0030663253232882924,
+                    0.0030072030620445812,
+                    0.0031203234967003115,
+                    0.0031249549236622882,
+                ],
+                [
+                    0.004611622534675876,
+                    0.0045228695549961,
+                    0.00468061004110465,
+                    0.004687374269766231,
+                ],
+                [
+                    0.006146594040204178,
+                    0.005960582237606247,
+                    0.006245348361630298,
+                    0.006249373374759063,
+                ],
+                [
+                    0.007673213056814943,
+                    0.007515847206238609,
+                    0.007798852586062996,
+                    0.007812049226869316,
+                ],
+                [
+                    0.009151014100149768,
+                    0.009102713201089198,
+                    0.009357521408330401,
+                    0.009374552954505537,
+                ],
+                [
+                    0.010660491033527127,
+                    0.01064305951504625,
+                    0.010928296150583189,
+                    0.01093741655317899,
+                ],
+                [
+                    0.012220059880731935,
+                    0.012035685563821306,
+                    0.012482928002425116,
+                    0.012498913658143424,
+                ],
+                [
+                    0.013680673816265436,
+                    0.013715733276286592,
+                    0.013981127748202161,
+                    0.014061366721026453,
+                ],
+                [
+                    0.015174940520457508,
+                    0.015234506358900817,
+                    0.015588970292597613,
+                    0.015624580899220768,
+                ],
+                [
+                    0.016752200195542626,
+                    0.016778725144222875,
+                    0.017144367553352507,
+                    0.017182579863671162,
+                ],
+                [
+                    0.018053528345731963,
+                    0.018408664272613458,
+                    0.01872938930674759,
+                    0.01874977648124981,
+                ],
+                [
+                    0.01975387083745445,
+                    0.019818324222173556,
+                    0.020237354515782693,
+                    0.020312257854687293,
+                ],
+                [
+                    0.02117207822447013,
+                    0.021389692297939588,
+                    0.02183551241771438,
+                    0.021873737835234084,
+                ],
+                [
+                    0.022654327655806352,
+                    0.02315323898226811,
+                    0.02334880811328792,
+                    0.023437455296473786,
+                ],
+                [
+                    0.02405071105996355,
+                    0.024651019872455215,
+                    0.02490325327689524,
+                    0.024999988079068204,
+                ],
+                [
+                    0.02553910406967493,
+                    0.02621751494844504,
+                    0.02649115801732914,
+                    0.026562449336003626,
+                ],
+                [
+                    0.027068705077564537,
+                    0.027843565934829936,
+                    0.027937640544998674,
+                    0.028108093649116907,
+                ],
+                [
+                    0.02844626465695245,
+                    0.029398637297495887,
+                    0.029535466995198215,
+                    0.029678651116758256,
+                ],
+                [
+                    0.030156613870263638,
+                    0.030973161893160215,
+                    0.031187945832628284,
+                    0.03124994039529838,
+                ],
+            ],
+            "moments": [
+                [1.0, 0.0, 0.0, -0.0],
+                [
+                    0.98544921875,
+                    0.028759765625000003,
+                    0.005175781250000001,
+                    0.003515625,
+                ],
+                [0.96142578125, 0.05439453125, 0.010937500000000001, 0.00107421875],
+                [
+                    0.946240234375,
+                    0.07880859375000002,
+                    0.016259765625000002,
+                    -0.0021972656250000004,
+                ],
+                [0.9275390625, 0.1203125, 0.0154296875, -0.005664062500000001],
+                [0.906005859375, 0.136474609375, 0.029541015625, -0.00537109375],
+                [
+                    0.86962890625,
+                    0.14355468750000003,
+                    0.03662109375000001,
+                    0.005859375000000001,
+                ],
+                [
+                    0.84345703125,
+                    0.16132812500000002,
+                    0.028710937500000002,
+                    0.0027343750000000003,
+                ],
+                [0.831640625, 0.21601562500000002, 0.041796875000000004, 0.010546875],
+                [0.79169921875, 0.1986328125, 0.0966796875, 0.011425781250000001],
+                [0.76171875, 0.22216796875, 0.06787109375, 0.00732421875],
+                [
+                    0.7540039062499999,
+                    0.23847656250000002,
+                    0.077880859375,
+                    0.026318359375000003,
+                ],
+                [
+                    0.6759765624999999,
+                    0.22792968750000003,
+                    0.05625000000000001,
+                    0.005859375000000001,
+                ],
+                [0.697216796875, 0.285009765625, 0.11171875, 0.00634765625],
+                [
+                    0.64794921875,
+                    0.29326171875,
+                    0.08408203125000001,
+                    -0.015039062500000002,
+                ],
+                [0.615478515625, 0.23291015625, 0.13037109375, -0.0029296875],
+                [0.56328125, 0.26640625, 0.140625, -0.0015625],
+                [
+                    0.5326660156249999,
+                    0.27309570312500003,
+                    0.12451171875000001,
+                    0.0033203125000000003,
+                ],
+                [0.5113281249999999, 0.25400390625, 0.207421875, 0.06240234375],
+                [0.45634765624999996, 0.264404296875, 0.192041015625, 0.04638671875],
+                [0.4755859375, 0.265625, 0.1259765625, 0.00390625],
+            ],
+            "classical": [
+                [1.0, 0.0, 0.0, 0.0],
+                [
+                    0.9785658254890135,
+                    0.032640627488098956,
+                    0.0006529991387175071,
+                    9.331225370312987e-06,
+                ],
+                [
+                    0.9543969745564174,
+                    0.06379678451788694,
+                    0.002554792256676088,
+                    7.307760447489675e-05,
+                ],
+                [
+                    0.9277014986282479,
+                    0.09333158536901517,
+                    0.005614344409595418,
+                    0.0002412354603451173,
+                ],
+                [
+                    0.8986960933329977,
+                    0.12112408632483772,
+                    0.009734495534496507,
+                    0.000558814252716307,
+                ],
+                [
+                    0.8676043324765077,
+                    0.14706959521540358,
+                    0.014813020286766473,
+                    0.0010656979890273613,
+                ],
+                [
+                    0.8346549130285322,
+                    0.17107984684789965,
+                    0.02074368328138845,
+                    0.0017965542809773411,
+                ],
+                [
+                    0.8000799239993892,
+                    0.1930830481269454,
+                    0.02741728179787245,
+                    0.0027807897377846017,
+                ],
+                [
+                    0.7641131514108843,
+                    0.21302379751661057,
+                    0.03472266842021771,
+                    0.004042550084896357,
+                ],
+                [
+                    0.7269884308241243,
+                    0.23086288427670745,
+                    0.042547746536408367,
+                    0.005600763118858469,
+                ],
+                [
+                    0.6889380580861924,
+                    0.24657697361451777,
+                    0.0507804321113978,
+                    0.007469222356541817,
+                ],
+                [
+                    0.6501912681064121,
+                    0.2601581845270441,
+                    0.05930957566810249,
+                    0.009656709010857205,
+                ],
+                [
+                    0.6109727905795657,
+                    0.27161356766618594,
+                    0.06802583895739321,
+                    0.012167149726160675,
+                ],
+                [
+                    0.5715014906464374,
+                    0.28096449103868026,
+                    0.07682252136524438,
+                    0.014999807335206842,
+                ],
+                [
+                    0.5319891015298508,
+                    0.28824594175356805,
+                    0.08559633168792094,
+                    0.018149501755970993,
+                ],
+                [
+                    0.4926390552152229,
+                    0.2935057523523785,
+                    0.09424810149927634,
+                    0.021606858030932735,
+                ],
+                [
+                    0.4536454162666588,
+                    0.29680376050174323,
+                    0.10268343693295559,
+                    0.025358578423282624,
+                ],
+                [
+                    0.4151919228905937,
+                    0.2982109109959553,
+                    0.11081330630173518,
+                    0.029387735423562517,
+                ],
+                [
+                    0.3774511383864787,
+                    0.2978083091097817,
+                    0.11855456157177732,
+                    0.03367408248587661,
+                ],
+                [
+                    0.3405837151652106,
+                    0.2956862343618503,
+                    0.12583039229681742,
+                    0.03819437930422272,
+                ],
+                [
+                    0.3047377725777113,
+                    0.2919431236988564,
+                    0.13257071119207275,
+                    0.04292272845574516,
+                ],
+            ],
+        },
+    },
+    "pilot": {
+        "metadata": {
+            "backend": "ibm_fez",
+            "times": [0.0, 1.0, 2.0],
+            "theta": [
+                [
+                    [
+                        1.2134884016147465,
+                        0.05209028805226058,
+                        0.015099158058442854,
+                        -0.0018621951713157087,
+                        -0.0002524591071452053,
+                        -8.491242247734204e-05,
+                    ],
+                    [
+                        0.7883700105634536,
+                        0.264851674004387,
+                        -0.012831738766241855,
+                        -0.0015915832770239523,
+                        0.000810876207656334,
+                        1.771484157133877e-05,
+                    ],
+                    [
+                        0.9117042978448544,
+                        -0.153773661947215,
+                        -0.01731699316954488,
+                        0.003706430723787734,
+                        0.0002261394073382022,
+                        8.430277007464727e-05,
+                    ],
+                ],
+                [
+                    [
+                        1.5587969253837375,
+                        -0.02314904239726647,
+                        -0.0102594029925758,
+                        0.0008917385042664382,
+                        -3.73409831062473e-05,
+                        -3.883161764608391e-05,
+                    ],
+                    [
+                        0.8988873394956293,
+                        0.17131742021429414,
+                        -0.00010836487062610769,
+                        -0.0015619099841096416,
+                        -1.7424026980491627e-05,
+                        -1.6904658740366887e-05,
+                    ],
+                    [
+                        -0.04959500584876058,
+                        -0.006169136668309657,
+                        0.0367449147737042,
+                        -0.006269148138949346,
+                        0.00044514193531575055,
+                        3.327722238818588e-05,
+                    ],
+                ],
+            ],
+            "results_sha256": "1a5dc30e07f4951f772897465555878975a8fc2f2a7c66fbc9d5f00ee22c8f58",
+            "precision_requested": 0.05,
+            "options": {
+                "resilience_level": 0,
+                "max_execution_time": 120,
+                "twirling": {"enable_gates": False, "enable_measure": False},
+                "dynamical_decoupling": {"enable": False},
+            },
+            "optimization_level": 1,
+            "seed_transpiler": 71,
+            "isa_depth": 9,
+            "isa_ops": {"rz": 8, "sx": 7, "cz": 1},
+            "final_index_layout": [0, 1],
+            "versions": {"qiskit": "2.6.2", "qiskit-ibm-runtime": "0.52.1"},
+            "job_id": "dbu7akgvv3fc73c0theg",
+            "submitted_utc": "2026-11-17T15:40:02.584699+00:00",
+            "completed_utc": "2026-11-17T15:40:10.948673+00:00",
+            "mse_against_P3": 0.004148975633709675,
+            "pub_metadata": [
+                {
+                    "shots": 400,
+                    "target_precision": 0.05,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 400,
+                    "target_precision": 0.05,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 400,
+                    "target_precision": 0.05,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 400,
+                    "target_precision": 0.05,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 400,
+                    "target_precision": 0.05,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+                {
+                    "shots": 400,
+                    "target_precision": 0.05,
+                    "circuit_metadata": {},
+                    "num_randomizations": 1,
+                },
+            ],
+            "result_metadata": {
+                "dynamical_decoupling": {
+                    "enable": False,
+                    "sequence_type": "XX",
+                    "extra_slack_distribution": "middle",
+                    "scheduling_method": "alap",
+                },
+                "twirling": {
+                    "enable_gates": False,
+                    "enable_measure": False,
+                    "num_randomizations": "auto",
+                    "shots_per_randomization": "auto",
+                    "interleave_randomizations": True,
+                    "strategy": "active-accum",
+                },
+                "resilience": {
+                    "measure_mitigation": False,
+                    "zne_mitigation": False,
+                    "pec_mitigation": False,
+                },
+                "version": 2,
+            },
+        },
+        "arrays": {
+            "t": [0.0, 1.0, 2.0],
+            "expectations": [
+                [-0.095, 0.28, -0.01, 0.0],
+                [-0.22, 0.18, 0.08, 0.01],
+                [-0.275, 0.13, 0.125, 0.03],
+            ],
+            "stds": [
+                [0.049773863623391736, 0.048, 0.04999749993749688, 0.05],
+                [
+                    0.048774993593028795,
+                    0.04918333050943175,
+                    0.04983974317750845,
+                    0.04999749993749688,
+                ],
+                [
+                    0.048072211307573526,
+                    0.04957569969249046,
+                    0.049607837082461075,
+                    0.04997749493522059,
+                ],
+            ],
+            "moment_stds": [
+                [0.0, 0.0, 0.0, 0.0],
+                [
+                    0.048774993593028795,
+                    0.04918333050943175,
+                    0.04983974317750845,
+                    0.04999749993749688,
+                ],
+                [
+                    0.09614442261514705,
+                    0.09915139938498092,
+                    0.09921567416492215,
+                    0.09995498987044119,
+                ],
+            ],
+            "moments": [
+                [1.0, 0.0, -0.0, 0.0],
+                [0.78, 0.18, 0.08, 0.01],
+                [0.44999999999999996, 0.26, 0.25, 0.06],
+            ],
+            "classical": [
+                [1.0, 0.0, 0.0, 0.0],
+                [
+                    0.6889380580861924,
+                    0.24657697361451777,
+                    0.0507804321113978,
+                    0.007469222356541817,
+                ],
+                [
+                    0.3047377725777113,
+                    0.2919431236988564,
+                    0.13257071119207275,
+                    0.04292272845574516,
+                ],
+            ],
+        },
+    },
+}
+
+if __name__ == "__main__":
+    main()

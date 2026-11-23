@@ -18,15 +18,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 BASE = Path(__file__).resolve().parent / "Final_Project_output"
-plt.rcParams.update(
-    {
-        "font.size": 10,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "figure.dpi": 150,
-    }
-)
-
 
 # ========================================================================
 # 1. CLASSICAL REFERENCES, CIRCUIT READOUTS AND LOCAL TRAINING
